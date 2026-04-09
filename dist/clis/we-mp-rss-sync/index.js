@@ -108,6 +108,7 @@ function readSubscriptions(vault, subsFolder) {
                 alias: data.alias || file.replace(/\.md$/, ''),
                 status: data.status === 'inactive' ? 'inactive' : 'active',
                 refresh_interval: data.refresh_interval ? parseInt(data.refresh_interval, 10) : undefined,
+                sync_count: data.sync_count ? parseInt(data.sync_count, 10) : undefined,
             });
         }
     }
@@ -649,7 +650,7 @@ cli({
 
             // Get articles for this mp (get more for first sync)
             const isFirstSync = !syncState[sub.mp_id]?.last_sync;
-            const limit = isFirstSync ? 100 : (kwargs.limit || 50);
+            const limit = isFirstSync ? (sub.sync_count || 100) : (kwargs.limit || 50);
             let articles = [];
             try {
                 articles = await getArticlesFromServer(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, sub.mp_id, limit);
