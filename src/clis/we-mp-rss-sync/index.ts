@@ -198,7 +198,7 @@ function writeArticleToVault(
 
   // Simple HTML to markdown conversion (strip tags, basic formatting)
   let body = article.content || article.content_html || '';
-  if (article.content_html) {
+  if (body.includes('<') && body.includes('>')) {
     body = htmlToMarkdown(body);
   }
 
@@ -235,6 +235,10 @@ function htmlToMarkdown(html: string): string {
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/\n{3,}/g, '\n\n')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line.length > 0)
+    .join('\n')
     .trim();
 }
 

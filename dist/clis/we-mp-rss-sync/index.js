@@ -66,11 +66,10 @@ function parseFrontmatter(content) {
 }
 function buildFrontmatter(data) {
     const lines = Object.entries(data).map(([k, v]) => {
-        const str = String(v ?? '');
-        if (str.includes(':') || str.includes('"') || str.includes("'") || str.includes('\n')) {
-            return `${k}: "${str.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
+        if (v.includes(':') || v.includes('"') || v.includes("'") || v.includes('\n')) {
+            return `${k}: "${v.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
         }
-        return `${k}: ${str}`;
+        return `${k}: ${v}`;
     });
     return `---\n${lines.join('\n')}\n---\n\n`;
 }
@@ -126,13 +125,7 @@ function writeArticleToVault(vault, articlesFolder, sub, article) {
     const subDir = path.join(vault, articlesFolder, sanitizeFilename(sub.alias));
     ensureDir(subDir);
     // Create filename from date and title
-    let dateStr;
-    if (article.publish_time) {
-        const ts = typeof article.publish_time === 'number' ? article.publish_time * 1000 : article.publish_time;
-        dateStr = new Date(ts).toISOString().split('T')[0];
-    } else {
-        dateStr = new Date().toISOString().split('T')[0];
-    }
+    const dateStr = article.publish_time ? article.publish_time.split(' ')[0] : new Date().toISOString().split('T')[0];
     const safeTitle = sanitizeFilename(article.title).substring(0, 80);
     const filename = `${dateStr}-${safeTitle}.md`;
     const filePath = path.join(subDir, filename);
@@ -151,7 +144,7 @@ function writeArticleToVault(vault, articlesFolder, sub, article) {
     });
     // Simple HTML to markdown conversion (strip tags, basic formatting)
     let body = article.content || article.content_html || '';
-    if (article.content_html) {
+    if (body.includes('<') && body.includes('>')) {
         body = htmlToMarkdown(body);
     }
     const mdContent = frontmatter + `# ${article.title}\n\n${body}\n`;
@@ -185,6 +178,10 @@ function htmlToMarkdown(html) {
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'")
         .replace(/\n{3,}/g, '\n\n')
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0)
+        .join('\n')
         .trim();
 }
 // ============================================================
@@ -196,17 +193,18 @@ async function getToken(baseUrl, username, password) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`,
     });
-    if (!res.ok) throw new Error(`Login failed: ${res.status}`);
+    if (!res.ok)
+        throw new Error(`Login failed: ${res.status}`);
     const json = await res.json();
     return json.data?.access_token || '';
 }
-
 async function apiFetch(baseUrl, apiBase, akSk, username, password, apiPath, options = {}) {
     const url = `${baseUrl}${apiBase}${apiPath}`;
     const headers = { 'Content-Type': 'application/json' };
     if (akSk) {
         headers['Authorization'] = `AK-SK ${akSk}`;
-    } else if (username && password) {
+    }
+    else if (username && password) {
         const token = await getToken(baseUrl, username, password);
         headers['Authorization'] = `Bearer ${token}`;
     }
@@ -219,7 +217,7 @@ async function apiFetch(baseUrl, apiBase, akSk, username, password, apiPath, opt
 }
 async function getSubsFromServer(baseUrl, apiBase, akSk, username, password) {
     const result = await apiFetch(baseUrl, apiBase, akSk, username, password, '/mps?limit=100');
-    const list = result?.data?.list || result?.data || result?.list || [];
+    const list = result?.list || result?.data || [];
     return list.map((mp) => ({ mp_id: mp.mp_id || mp.id, mp_name: mp.mp_name || mp.name }));
 }
 async function addMpToServer(baseUrl, apiBase, akSk, username, password, mpName, mpId) {
@@ -233,7 +231,7 @@ async function addMpToServer(baseUrl, apiBase, akSk, username, password, mpName,
 }
 async function getArticlesFromServer(baseUrl, apiBase, akSk, username, password, mpId, limit = 50) {
     const result = await apiFetch(baseUrl, apiBase, akSk, username, password, `/articles?mp_id=${encodeURIComponent(mpId)}&limit=${limit}&content=true`);
-    const list = result?.data?.list || result?.data || result?.list || [];
+    const list = result?.list || result?.data || [];
     return list.map((art) => ({
         article_id: art.article_id || art.id,
         title: art.title,
@@ -245,28 +243,6 @@ async function getArticlesFromServer(baseUrl, apiBase, akSk, username, password,
         mp_name: art.mp_name || '',
         mp_id: art.mp_id || mpId,
     }));
-}
-
-// Refresh article content (async, requires polling)
-async function refreshArticleContent(baseUrl, apiBase, akSk, username, password, articleId, maxWaitMs = 60000) {
-    // Start refresh
-    const refreshResult = await apiFetch(baseUrl, apiBase, akSk, username, password, `/articles/${encodeURIComponent(articleId)}/refresh`, { method: 'POST' });
-    if (refreshResult.code !== 0 || !refreshResult.data?.task_id) {
-        throw new Error(refreshResult.message || 'Failed to start refresh');
-    }
-    const taskId = refreshResult.data.task_id;
-    const startTime = Date.now();
-    // Poll for completion
-    while (Date.now() - startTime < maxWaitMs) {
-        await new Promise(r => setTimeout(r, 2000));
-        const statusResult = await apiFetch(baseUrl, apiBase, akSk, username, password, `/articles/refresh/tasks/${taskId}`);
-        const status = statusResult.data?.status;
-        if (status === 'success' || status === 'completed') break;
-        if (status === 'failed') throw new Error('Article refresh failed');
-    }
-    // Get article with content
-    const articleResult = await apiFetch(baseUrl, apiBase, akSk, username, password, `/articles/${encodeURIComponent(articleId)}`);
-    return articleResult.data;
 }
 // ============================================================
 // CLI Commands
@@ -362,27 +338,11 @@ cli({
             }
             // Sort by publish_time descending (newest first)
             newArticles.sort((a, b) => new Date(b.publish_time).getTime() - new Date(a.publish_time).getTime());
-            // Write new articles to vault (refresh content first if needed)
+            // Write new articles to vault
             let writtenCount = 0;
             const writtenFiles = [];
             for (const article of newArticles) {
-                let articleWithContent = article;
-                // If no content, try to refresh it
-                if (!article.content && !article.content_html && article.article_id) {
-                    try {
-                        const refreshed = await refreshArticleContent(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, article.article_id);
-                        if (refreshed.content || refreshed.content_html) {
-                            articleWithContent = {
-                                ...article,
-                                content: refreshed.content || '',
-                                content_html: refreshed.content_html || '',
-                            };
-                        }
-                    } catch (e) {
-                        // Continue without content
-                    }
-                }
-                const filePath = writeArticleToVault(cfg.vault, cfg.articlesFolder, sub, articleWithContent);
+                const filePath = writeArticleToVault(cfg.vault, cfg.articlesFolder, sub, article);
                 if (filePath) {
                     writtenCount++;
                     writtenFiles.push(path.basename(filePath));
