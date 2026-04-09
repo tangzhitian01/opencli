@@ -139,36 +139,37 @@ function sanitizeFolderName(name) {
     return name.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, '_').substring(0, 80);
 }
 
-function formatPublishTime(publishTime) {
+function formatPublishTime(publishTime, includeTime = false) {
     if (!publishTime) return new Date().toISOString().split('T')[0];
-    // If it's a number (Unix timestamp), convert to date string
+    let date;
+    // If it's a number (Unix timestamp), convert to date
     if (typeof publishTime === 'number') {
-        return new Date(publishTime * 1000).toISOString().split('T')[0];
+        date = new Date(publishTime * 1000);
+    } else {
+        date = new Date(publishTime);
     }
-    // If it's a string, try to parse and format
-    try {
-        const date = new Date(publishTime);
-        if (isNaN(date.getTime())) {
-            return new Date().toISOString().split('T')[0];
-        }
-        return date.toISOString().split('T')[0];
-    } catch {
-        return new Date().toISOString().split('T')[0];
+    if (isNaN(date.getTime())) {
+        date = new Date();
     }
+    const dateStr = date.toISOString().split('T')[0];
+    if (!includeTime) return dateStr;
+    // Format: yyyy-mm-dd-hh-mm-ss
+    const timeStr = date.toTimeString().split(' ')[0].replace(/:/g, '-');
+    return `${dateStr}-${timeStr}`;
 }
 
 /**
  * Write article with subfolder structure (title-based folder with images inside)
- * Format: WeChat-Articles/{mp_name}/{date}-{title}/{title}.md
- * Images: WeChat-Articles/{mp_name}/{date}-{title}/images/*
+ * Format: WeChat-Articles/{mp_name}/{yyyy-mm-dd-hh-mm-ss}-{title}/{yyyy-mm-dd-hh-mm-ss}-{title}.md
+ * Images: WeChat-Articles/{mp_name}/{yyyy-mm-dd-hh-mm-ss}-{title}/images/*
  */
 function writeArticleToVault(vault, articlesFolder, sub, article) {
     const subDir = path.join(vault, articlesFolder, sanitizeFilename(sub.alias));
     ensureDir(subDir);
-    // Create subfolder name from date and title
-    const dateStr = formatPublishTime(article.publish_time);
-    const safeTitle = sanitizeFolderName(article.title).substring(0, 80);
-    const subfolder = `${dateStr}-${safeTitle}`;
+    // Create subfolder name from date-time and title (include time for uniqueness)
+    const dateTimeStr = formatPublishTime(article.publish_time, true); // yyyy-mm-dd-hh-mm-ss
+    const safeTitle = sanitizeFolderName(article.title).substring(0, 60);
+    const subfolder = `${dateTimeStr}-${safeTitle}`;
     const articleDir = path.join(subDir, subfolder);
     ensureDir(articleDir);
     // Filename inside subfolder
@@ -360,6 +361,43 @@ async function downloadArticleViaWeixin(url, outputBaseDir) {
     } catch (e) {
         return { success: false, error: e.message };
     }
+}
+
+// Import MPs from CSV file content
+async function importMpsViaFile(baseUrl, username, password, filePath) {
+    return new Promise((resolve, reject) => {
+        const { spawn } = require('node:child_process');
+        // Get token first
+        getToken(baseUrl, username, password).then(token => {
+            const cmd = 'curl';
+            const args = [
+                '-s', '-X', 'POST',
+                `${baseUrl}/api/v1/wx/export/mps/import`,
+                '-H', `Authorization: Bearer ${token}`,
+                '-F', `file=@${filePath}`
+            ];
+            const child = spawn(cmd, args);
+            let stdout = '', stderr = '';
+            child.stdout.on('data', d => stdout += d);
+            child.stderr.on('data', d => stderr += d);
+            child.on('close', code => {
+                if (code === 0) resolve(stdout);
+                else reject(new Error(stderr || `curl failed with code ${code}`));
+            });
+            child.on('error', reject);
+        }).catch(reject);
+    });
+}
+
+// Update subscription file with new mp_id
+function updateSubscriptionMpId(vault, subsFolder, alias, mpId) {
+    const fileName = `${sanitizeFilename(alias)}.md`;
+    const filePath = path.join(vault, subsFolder, fileName);
+    if (!fs.existsSync(filePath)) return;
+    const content = fs.readFileSync(filePath, 'utf-8');
+    // Update mp_id in frontmatter
+    const updated = content.replace(/^mp_id:.*$/m, `mp_id: "${mpId}"`);
+    fs.writeFileSync(filePath, updated, 'utf-8');
 }
 
 // Fetch article content directly from WeChat URL (fast!)
@@ -556,7 +594,7 @@ cli({
             return [[{ alias: 'error', status: String(e), new_articles: 0, files: '-' }]];
         }
         const serverMpIds = new Set(serverSubs.map(s => s.mp_id));
-        // 3. Add missing subscriptions to server
+        // 3. Process subscriptions
         const results = [];
         const syncState = readSyncState(cfg.vault, cfg.stateFile);
         for (const sub of subs) {
@@ -564,6 +602,36 @@ cli({
                 results.push({ alias: sub.alias, status: 'skipped (inactive)', new_articles: 0, files: '-' });
                 continue;
             }
+
+            // If mp_id is empty but mp_name exists, search for faker_id and try to import
+            if (!sub.mp_id && sub.mp_name) {
+                try {
+                    const searchResults = await searchMps(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, sub.mp_name);
+                    if (searchResults.length > 0) {
+                        // Try to import using faker_id from search results
+                        const mpInfo = searchResults[0];
+                        const fakeId = mpInfo.fakeid || '';
+                        // Generate mp_id from fakeid: MP_WXS_ + (fakeid without first 3 chars Mz)
+                        const mpId = fakeId ? 'MP_WXS_' + fakeId.replace(/^Mz/i, '').replace(/^=/, '') : '';
+                        if (mpId && mpId.length > 8) {
+                            // Import to server
+                            const csvContent = `id,公众号名称,封面图,简介,状态,创建时间,faker_id\n${mpId},${mpInfo.mp_name || sub.mp_name},${mpInfo.mp_cover || ''},${mpInfo.mp_intro || ''},1,,${fakeId}`;
+                            // Create temp file and import via API
+                            const fs = require('node:fs');
+                            const tmpFile = path.join(require('node:os').tmpdir(), `mp_import_${Date.now()}.csv`);
+                            fs.writeFileSync(tmpFile, csvContent);
+                            await importMpsViaFile(cfg.baseUrl, cfg.username, cfg.password, tmpFile);
+                            fs.unlinkSync(tmpFile);
+                            // Update subscription file with new mp_id
+                            updateSubscriptionMpId(cfg.vault, cfg.subsFolder, sub.alias, mpId);
+                            sub.mp_id = mpId; // Update for subsequent operations
+                        }
+                    }
+                } catch {
+                    // Ignore search/import errors
+                }
+            }
+
             // Check if mp_id is missing on server
             if (sub.mp_id && !serverMpIds.has(sub.mp_id)) {
                 try {
@@ -573,27 +641,35 @@ cli({
                     // Ignore add errors, continue with sync
                 }
             }
-            // Get articles for this mp
+
+            if (!sub.mp_id) {
+                results.push({ alias: sub.alias, status: 'no mp_id', new_articles: 0, files: '-' });
+                continue;
+            }
+
+            // Get articles for this mp (get more for first sync)
+            const isFirstSync = !syncState[sub.mp_id]?.last_sync;
+            const limit = isFirstSync ? 100 : (kwargs.limit || 50);
             let articles = [];
             try {
-                articles = await getArticlesFromServer(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, sub.mp_id, kwargs.limit || 50);
+                articles = await getArticlesFromServer(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, sub.mp_id, limit);
             }
             catch (e) {
                 results.push({ alias: sub.alias, status: `fetch error: ${e.message}`, new_articles: 0, files: '-' });
                 continue;
             }
-            // Filter to only new articles (based on sync state)
-            const lastSync = syncState[sub.mp_id]?.last_sync;
-            let newArticles = articles;
-            if (lastSync) {
-                const lastSyncDate = new Date(lastSync);
-                newArticles = articles.filter(a => {
-                    const pubDate = new Date(a.publish_time);
-                    return pubDate > lastSyncDate;
-                });
-            }
+
             // Sort by publish_time descending (newest first)
-            newArticles.sort((a, b) => new Date(b.publish_time).getTime() - new Date(a.publish_time).getTime());
+            articles.sort((a, b) => new Date(b.publish_time).getTime() - new Date(a.publish_time).getTime());
+
+            // Filter to only new articles (based on publish_time, not sync time)
+            const lastSyncPubTime = syncState[sub.mp_id]?.last_publish_time;
+            let newArticles = articles;
+            if (lastSyncPubTime) {
+                const lastPubTime = new Date(lastSyncPubTime).getTime();
+                newArticles = articles.filter(a => new Date(a.publish_time).getTime() > lastPubTime);
+            }
+
             // Write new articles to vault
             let writtenCount = 0;
             const writtenFiles = [];
@@ -629,16 +705,17 @@ cli({
                     }
                 }
             }
-            // Update sync state
+            // Update sync state (track by publish_time for proper incremental sync)
             if (articles.length > 0) {
                 syncState[sub.mp_id] = {
                     last_sync: new Date().toISOString(),
+                    last_publish_time: articles[0].publish_time,
                     last_article_id: articles[0].article_id,
                 };
             }
             results.push({
                 alias: sub.alias,
-                status: writtenCount > 0 ? 'synced' : 'up-to-date',
+                status: writtenCount > 0 ? 'synced' : (isFirstSync ? 'full-sync' : 'up-to-date'),
                 new_articles: writtenCount,
                 files: writtenFiles.length > 0 ? writtenFiles.slice(0, 3).join(', ') + (writtenFiles.length > 3 ? ` (+${writtenFiles.length - 3})` : '') : '-',
             });
@@ -739,7 +816,20 @@ cli({
         const cfg = getConfig(kwargs);
         const mpName = String(kwargs.mp_name);
         const alias = String(kwargs.alias || mpName).trim();
-        const mpId = kwargs.mp_id ? String(kwargs.mp_id) : '';
+        let mpId = kwargs.mp_id ? String(kwargs.mp_id) : '';
+
+        // If mp_id not provided, try to search on server
+        if (!mpId) {
+            try {
+                const searchResults = await searchMps(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, mpName);
+                if (searchResults.length > 0) {
+                    mpId = searchResults[0].mp_id;
+                }
+            } catch {
+                // Ignore search errors
+            }
+        }
+
         // Create subscription file
         const subsDir = path.join(cfg.vault, cfg.subsFolder);
         ensureDir(subsDir);
