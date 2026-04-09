@@ -246,6 +246,28 @@ async function getArticlesFromServer(baseUrl, apiBase, akSk, username, password,
         mp_id: art.mp_id || mpId,
     }));
 }
+
+// Refresh article content (async, requires polling)
+async function refreshArticleContent(baseUrl, apiBase, akSk, username, password, articleId, maxWaitMs = 60000) {
+    // Start refresh
+    const refreshResult = await apiFetch(baseUrl, apiBase, akSk, username, password, `/articles/${encodeURIComponent(articleId)}/refresh`, { method: 'POST' });
+    if (refreshResult.code !== 0 || !refreshResult.data?.task_id) {
+        throw new Error(refreshResult.message || 'Failed to start refresh');
+    }
+    const taskId = refreshResult.data.task_id;
+    const startTime = Date.now();
+    // Poll for completion
+    while (Date.now() - startTime < maxWaitMs) {
+        await new Promise(r => setTimeout(r, 2000));
+        const statusResult = await apiFetch(baseUrl, apiBase, akSk, username, password, `/articles/refresh/tasks/${taskId}`);
+        const status = statusResult.data?.status;
+        if (status === 'success' || status === 'completed') break;
+        if (status === 'failed') throw new Error('Article refresh failed');
+    }
+    // Get article with content
+    const articleResult = await apiFetch(baseUrl, apiBase, akSk, username, password, `/articles/${encodeURIComponent(articleId)}`);
+    return articleResult.data;
+}
 // ============================================================
 // CLI Commands
 // ============================================================
@@ -340,11 +362,27 @@ cli({
             }
             // Sort by publish_time descending (newest first)
             newArticles.sort((a, b) => new Date(b.publish_time).getTime() - new Date(a.publish_time).getTime());
-            // Write new articles to vault
+            // Write new articles to vault (refresh content first if needed)
             let writtenCount = 0;
             const writtenFiles = [];
             for (const article of newArticles) {
-                const filePath = writeArticleToVault(cfg.vault, cfg.articlesFolder, sub, article);
+                let articleWithContent = article;
+                // If no content, try to refresh it
+                if (!article.content && !article.content_html && article.article_id) {
+                    try {
+                        const refreshed = await refreshArticleContent(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, article.article_id);
+                        if (refreshed.content || refreshed.content_html) {
+                            articleWithContent = {
+                                ...article,
+                                content: refreshed.content || '',
+                                content_html: refreshed.content_html || '',
+                            };
+                        }
+                    } catch (e) {
+                        // Continue without content
+                    }
+                }
+                const filePath = writeArticleToVault(cfg.vault, cfg.articlesFolder, sub, articleWithContent);
                 if (filePath) {
                     writtenCount++;
                     writtenFiles.push(path.basename(filePath));
