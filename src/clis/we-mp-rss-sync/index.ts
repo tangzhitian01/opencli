@@ -57,7 +57,10 @@ interface SyncState {
 function getConfig(kwargs: Record<string, unknown>) {
   return {
     baseUrl: (process.env.WE_MP_RSS_URL || 'http://localhost:8001').replace(/\/+$/, ''),
+    apiBase: '/api/v1/wx',
     akSk: process.env.WE_MP_RSS_AK_SK || '',
+    username: process.env.WE_MP_RSS_USERNAME || '',
+    password: process.env.WE_MP_RSS_PASSWORD || '',
     vault: String(kwargs.vault || process.env.WE_MP_RSS_VAULT || '.'),
     subsFolder: String(kwargs.subs_folder || 'WeChat-Subscriptions'),
     articlesFolder: String(kwargs.articles_folder || 'WeChat-Articles'),
@@ -239,15 +242,34 @@ function htmlToMarkdown(html: string): string {
 // API Calls (Node.js native fetch)
 // ============================================================
 
+async function getToken(baseUrl: string, username: string, password: string): Promise<string> {
+  const res = await fetch(`${baseUrl}/api/v1/wx/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`,
+  });
+  if (!res.ok) throw new Error(`Login failed: ${res.status}`);
+  const json = await res.json() as any;
+  return json.data?.access_token || '';
+}
+
 async function apiFetch(
   baseUrl: string,
+  apiBase: string,
   akSk: string,
+  username: string,
+  password: string,
   apiPath: string,
   options: RequestInit = {},
 ): Promise<unknown> {
-  const url = `${baseUrl}${apiPath}`;
-  const headers = getHeaders(akSk);
-
+  const url = `${baseUrl}${apiBase}${apiPath}`;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (akSk) {
+    headers['Authorization'] = `AK-SK ${akSk}`;
+  } else if (username && password) {
+    const token = await getToken(baseUrl, username, password);
+    headers['Authorization'] = `Bearer ${token}`;
+  }
   const res = await fetch(url, { ...options, headers });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -256,16 +278,16 @@ async function apiFetch(
   return res.json();
 }
 
-async function getSubsFromServer(baseUrl: string, akSk: string): Promise<Array<{ mp_id: string; mp_name: string }>> {
-  const result = await apiFetch(baseUrl, akSk, '/api/mps?limit=100') as any;
+async function getSubsFromServer(baseUrl: string, apiBase: string, akSk: string, username: string, password: string): Promise<Array<{ mp_id: string; mp_name: string }>> {
+  const result = await apiFetch(baseUrl, apiBase, akSk, username, password, '/mps?limit=100') as any;
   const list = result?.list || result?.data || [];
   return list.map((mp: any) => ({ mp_id: mp.mp_id || mp.id, mp_name: mp.mp_name || mp.name }));
 }
 
-async function addMpToServer(baseUrl: string, akSk: string, mpName: string, mpId?: string): Promise<unknown> {
+async function addMpToServer(baseUrl: string, apiBase: string, akSk: string, username: string, password: string, mpName: string, mpId?: string): Promise<unknown> {
   const body: Record<string, string> = { mp_name: mpName };
   if (mpId) body['mp_id'] = mpId;
-  return apiFetch(baseUrl, akSk, '/api/mps', {
+  return apiFetch(baseUrl, apiBase, akSk, username, password, '/mps', {
     method: 'POST',
     body: JSON.stringify(body),
   });
@@ -273,13 +295,16 @@ async function addMpToServer(baseUrl: string, akSk: string, mpName: string, mpId
 
 async function getArticlesFromServer(
   baseUrl: string,
+  apiBase: string,
   akSk: string,
+  username: string,
+  password: string,
   mpId: string,
   limit: number = 50,
 ): Promise<Article[]> {
   const result = await apiFetch(
-    baseUrl, akSk,
-    `/api/articles?mp_id=${encodeURIComponent(mpId)}&limit=${limit}&content=true`,
+    baseUrl, apiBase, akSk, username, password,
+    `/articles?mp_id=${encodeURIComponent(mpId)}&limit=${limit}&content=true`,
   ) as any;
   const list = result?.list || result?.data || [];
   return list.map((art: any) => ({
@@ -348,7 +373,7 @@ cli({
     // 2. Get existing server subscriptions
     let serverSubs: Array<{ mp_id: string; mp_name: string }> = [];
     try {
-      serverSubs = await getSubsFromServer(cfg.baseUrl, cfg.akSk);
+      serverSubs = await getSubsFromServer(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password);
     } catch (e) {
       return [[{ alias: 'error', status: String(e), new_articles: 0, files: '-' }]];
     }
@@ -367,7 +392,7 @@ cli({
       // Check if mp_id is missing on server
       if (sub.mp_id && !serverMpIds.has(sub.mp_id)) {
         try {
-          await addMpToServer(cfg.baseUrl, cfg.akSk, sub.mp_name, sub.mp_id);
+          await addMpToServer(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, sub.mp_name, sub.mp_id);
         } catch {
           // Ignore add errors, continue with sync
         }
@@ -376,7 +401,7 @@ cli({
       // Get articles for this mp
       let articles: Article[] = [];
       try {
-        articles = await getArticlesFromServer(cfg.baseUrl, cfg.akSk, sub.mp_id, kwargs.limit as number || 50);
+        articles = await getArticlesFromServer(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, sub.mp_id, kwargs.limit as number || 50);
       } catch {
         results.push({ alias: sub.alias, status: 'fetch error', new_articles: 0, files: '-' });
         continue;
@@ -551,7 +576,7 @@ status: "active"
     // Try to add to server
     let serverStatus = 'added locally (server sync pending)';
     try {
-      await addMpToServer(cfg.baseUrl, cfg.akSk, mpName, mpId);
+      await addMpToServer(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, mpName, mpId);
       serverStatus = 'added to server';
     } catch {
       serverStatus = 'added locally (server error)';
@@ -597,7 +622,7 @@ cli({
 
     let articles: Article[] = [];
     try {
-      articles = await getArticlesFromServer(cfg.baseUrl, cfg.akSk, String(kwargs.mp_id), kwargs.limit as number || 10);
+      articles = await getArticlesFromServer(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, String(kwargs.mp_id), kwargs.limit as number || 10);
     } catch (e) {
       return [[{ title: 'error', author: String(e), publish_time: '-', url: '-' }]];
     }
