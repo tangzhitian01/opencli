@@ -66,10 +66,11 @@ function parseFrontmatter(content) {
 }
 function buildFrontmatter(data) {
     const lines = Object.entries(data).map(([k, v]) => {
-        if (v.includes(':') || v.includes('"') || v.includes("'") || v.includes('\n')) {
-            return `${k}: "${v.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
+        const str = String(v ?? '');
+        if (str.includes(':') || str.includes('"') || str.includes("'") || str.includes('\n')) {
+            return `${k}: "${str.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
         }
-        return `${k}: ${v}`;
+        return `${k}: ${str}`;
     });
     return `---\n${lines.join('\n')}\n---\n\n`;
 }
@@ -125,7 +126,13 @@ function writeArticleToVault(vault, articlesFolder, sub, article) {
     const subDir = path.join(vault, articlesFolder, sanitizeFilename(sub.alias));
     ensureDir(subDir);
     // Create filename from date and title
-    const dateStr = article.publish_time ? article.publish_time.split(' ')[0] : new Date().toISOString().split('T')[0];
+    let dateStr;
+    if (article.publish_time) {
+        const ts = typeof article.publish_time === 'number' ? article.publish_time * 1000 : article.publish_time;
+        dateStr = new Date(ts).toISOString().split('T')[0];
+    } else {
+        dateStr = new Date().toISOString().split('T')[0];
+    }
     const safeTitle = sanitizeFilename(article.title).substring(0, 80);
     const filename = `${dateStr}-${safeTitle}.md`;
     const filePath = path.join(subDir, filename);
