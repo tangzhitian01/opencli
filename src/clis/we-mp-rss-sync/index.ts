@@ -68,12 +68,6 @@ function getConfig(kwargs: Record<string, unknown>) {
   };
 }
 
-function getHeaders(akSk: string): Record<string, string> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (akSk) headers['Authorization'] = `AK-SK ${akSk}`;
-  return headers;
-}
-
 // ============================================================
 // Frontmatter Parsing
 // ============================================================
@@ -177,7 +171,7 @@ function writeArticleToVault(
   ensureDir(subDir);
 
   // Create filename from date and title
-  const dateStr = article.publish_time ? article.publish_time.split(' ')[0] : new Date().toISOString().split('T')[0];
+  const dateStr = article.publish_time ? article.publish_time.split('T')[0] : new Date().toISOString().split('T')[0];
   const safeTitle = sanitizeFilename(article.title).substring(0, 80);
   const filename = `${dateStr}-${safeTitle}.md`;
   const filePath = path.join(subDir, filename);
@@ -315,7 +309,7 @@ async function apiFetch(
 
 async function getSubsFromServer(baseUrl: string, apiBase: string, akSk: string, username: string, password: string): Promise<Array<{ mp_id: string; mp_name: string }>> {
   const result = await apiFetch(baseUrl, apiBase, akSk, username, password, '/mps?limit=100') as any;
-  const list = result?.list || result?.data || [];
+  const list = result?.data?.list || result?.list || result?.data || [];
   return list.map((mp: any) => ({ mp_id: mp.mp_id || mp.id, mp_name: mp.mp_name || mp.name }));
 }
 
@@ -339,20 +333,30 @@ async function getArticlesFromServer(
 ): Promise<Article[]> {
   const result = await apiFetch(
     baseUrl, apiBase, akSk, username, password,
-    `/articles?mp_id=${encodeURIComponent(mpId)}&limit=${limit}&content=true`,
+    `/articles?mp_id=${encodeURIComponent(mpId)}&limit=${limit}&has_content=true`,
   ) as any;
-  const list = result?.list || result?.data || [];
-  return list.map((art: any) => ({
-    article_id: art.article_id || art.id,
-    title: art.title,
-    author: art.author,
-    publish_time: art.publish_time || art.publishTime,
-    url: art.url,
-    content: art.content,
-    content_html: art.content_html,
-    mp_name: art.mp_name || '',
-    mp_id: art.mp_id || mpId,
-  }));
+  const list = result?.data?.list || result?.list || result?.data || [];
+  if (!Array.isArray(list)) {
+    return [];
+  }
+  return list.map((art: any) => {
+    // publish_time can be a Unix timestamp number or ISO string
+    let publishTime = art.publish_time || art.publishTime;
+    if (typeof publishTime === 'number') {
+      publishTime = new Date(publishTime * 1000).toISOString();
+    }
+    return {
+      article_id: art.article_id || art.id,
+      title: art.title,
+      author: art.author,
+      publish_time: publishTime,
+      url: art.url,
+      content: art.content,
+      content_html: art.content_html,
+      mp_name: art.mp_name || '',
+      mp_id: art.mp_id || mpId,
+    };
+  });
 }
 
 // ============================================================
@@ -437,7 +441,7 @@ cli({
       let articles: Article[] = [];
       try {
         articles = await getArticlesFromServer(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, sub.mp_id, kwargs.limit as number || 50);
-      } catch {
+      } catch (e: any) {
         results.push({ alias: sub.alias, status: 'fetch error', new_articles: 0, files: '-' });
         continue;
       }

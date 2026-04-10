@@ -261,7 +261,7 @@ async function addMpToServer(baseUrl, apiBase, akSk, username, password, mpName,
     });
 }
 async function getArticlesFromServer(baseUrl, apiBase, akSk, username, password, mpId, limit = 50) {
-    const result = await apiFetch(baseUrl, apiBase, akSk, username, password, `/articles?mp_id=${encodeURIComponent(mpId)}&limit=${limit}&content=true`);
+    const result = await apiFetch(baseUrl, apiBase, akSk, username, password, `/articles?mp_id=${encodeURIComponent(mpId)}&limit=${limit}&has_content=true`);
     const list = result?.list || result?.data || [];
     return list.map((art) => ({
         article_id: art.article_id || art.id,
@@ -319,6 +319,7 @@ cli({
         const cfg = getConfig(kwargs);
         // 1. Read local subscriptions
         const subs = readSubscriptions(cfg.vault, cfg.subsFolder);
+        console.error('DEBUG: subs.length =', subs.length);
         if (subs.length === 0) {
             return [[{ alias: '-', status: 'no subscriptions', new_articles: 0, files: '-' }]];
         }
@@ -395,7 +396,8 @@ cli({
         }
         // Save updated sync state
         writeSyncState(cfg.vault, cfg.stateFile, syncState);
-        return results;
+        console.error('DEBUG: results =', JSON.stringify(results));
+        return [results];
     },
 });
 /**
