@@ -16,6 +16,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { spawn } from 'node:child_process';
 import { cli, Strategy } from '../../registry.js';
 // ============================================================
 // Config
@@ -32,12 +33,6 @@ function getConfig(kwargs) {
         articlesFolder: String(kwargs.articles_folder || 'WeChat-Articles'),
         stateFile: '.we-mp-rss-sync-state.json',
     };
-}
-function getHeaders(akSk) {
-    const headers = { 'Content-Type': 'application/json' };
-    if (akSk)
-        headers['Authorization'] = `AK-SK ${akSk}`;
-    return headers;
 }
 // ============================================================
 // Frontmatter Parsing
@@ -121,11 +116,69 @@ function writeSyncState(vault, stateFile, state) {
 function sanitizeFilename(name) {
     return name.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, '-').substring(0, 100);
 }
+// Fetch article content from URL using weixin download
+async function fetchArticleContentFromUrl(url, vault) {
+    return new Promise((resolve) => {
+        const tmpDir = path.join(vault, '.smart-env', 'multi', 'tmp_fetch');
+        ensureDir(tmpDir);
+        // Call weixin download with output to tmp dir
+        const proc = spawn('opencli', ['weixin', 'download', '--url', url, '--output', tmpDir], {
+            cwd: vault,
+            shell: true,
+            env: { ...process.env },
+        });
+        proc.on('close', () => {
+            // Find the created markdown file (may be in subdirectory)
+            try {
+                if (fs.existsSync(tmpDir)) {
+                    // Recursively find all .md files
+                    const findMdFiles = (dir) => {
+                        let results = [];
+                        const entries = fs.readdirSync(dir, { withFileTypes: true });
+                        for (const entry of entries) {
+                            const fullPath = path.join(dir, entry.name);
+                            if (entry.isDirectory()) {
+                                results = results.concat(findMdFiles(fullPath));
+                            }
+                            else if (entry.name.endsWith('.md')) {
+                                results.push(fullPath);
+                            }
+                        }
+                        return results;
+                    };
+                    const files = findMdFiles(tmpDir);
+                    if (files.length > 0) {
+                        const mdPath = files[0];
+                        const fullContent = fs.readFileSync(mdPath, 'utf-8');
+                        // Clean up entire tmpDir
+                        fs.rmSync(tmpDir, { recursive: true, force: true });
+                        // Extract just the body content (after the last --- separator)
+                        // The format is: # Title\n\n> metadata...\n---\n# Title\n\nbody
+                        // Find the last --- separator and get everything after it
+                        const lastSepIdx = fullContent.lastIndexOf('\n---\n');
+                        if (lastSepIdx !== -1) {
+                            const body = fullContent.slice(lastSepIdx + 5).trim();
+                            resolve(body);
+                        }
+                        else {
+                            resolve(fullContent);
+                        }
+                        return;
+                    }
+                }
+            }
+            catch (e) {
+                // Fall through
+            }
+            resolve('');
+        });
+    });
+}
 function writeArticleToVault(vault, articlesFolder, sub, article) {
     const subDir = path.join(vault, articlesFolder, sanitizeFilename(sub.alias));
     ensureDir(subDir);
     // Create filename from date and title
-    const dateStr = article.publish_time ? article.publish_time.split(' ')[0] : new Date().toISOString().split('T')[0];
+    const dateStr = article.publish_time ? article.publish_time.split('T')[0] : new Date().toISOString().split('T')[0];
     const safeTitle = sanitizeFilename(article.title).substring(0, 80);
     const filename = `${dateStr}-${safeTitle}.md`;
     const filePath = path.join(subDir, filename);
@@ -248,7 +301,7 @@ async function apiFetch(baseUrl, apiBase, akSk, username, password, apiPath, opt
 }
 async function getSubsFromServer(baseUrl, apiBase, akSk, username, password) {
     const result = await apiFetch(baseUrl, apiBase, akSk, username, password, '/mps?limit=100');
-    const list = result?.list || result?.data || [];
+    const list = result?.data?.list || result?.list || result?.data || [];
     return list.map((mp) => ({ mp_id: mp.mp_id || mp.id, mp_name: mp.mp_name || mp.name }));
 }
 async function addMpToServer(baseUrl, apiBase, akSk, username, password, mpName, mpId) {
@@ -262,18 +315,28 @@ async function addMpToServer(baseUrl, apiBase, akSk, username, password, mpName,
 }
 async function getArticlesFromServer(baseUrl, apiBase, akSk, username, password, mpId, limit = 50) {
     const result = await apiFetch(baseUrl, apiBase, akSk, username, password, `/articles?mp_id=${encodeURIComponent(mpId)}&limit=${limit}&has_content=true`);
-    const list = result?.list || result?.data || [];
-    return list.map((art) => ({
-        article_id: art.article_id || art.id,
-        title: art.title,
-        author: art.author,
-        publish_time: art.publish_time || art.publishTime,
-        url: art.url,
-        content: art.content,
-        content_html: art.content_html,
-        mp_name: art.mp_name || '',
-        mp_id: art.mp_id || mpId,
-    }));
+    const list = result?.data?.list || result?.list || result?.data || [];
+    if (!Array.isArray(list)) {
+        return [];
+    }
+    return list.map((art) => {
+        // publish_time can be a Unix timestamp number or ISO string
+        let publishTime = art.publish_time || art.publishTime;
+        if (typeof publishTime === 'number') {
+            publishTime = new Date(publishTime * 1000).toISOString();
+        }
+        return {
+            article_id: art.article_id || art.id,
+            title: art.title,
+            author: art.author,
+            publish_time: publishTime,
+            url: art.url,
+            content: art.content,
+            content_html: art.content_html,
+            mp_name: art.mp_name || '',
+            mp_id: art.mp_id || mpId,
+        };
+    });
 }
 // ============================================================
 // CLI Commands
@@ -319,7 +382,6 @@ cli({
         const cfg = getConfig(kwargs);
         // 1. Read local subscriptions
         const subs = readSubscriptions(cfg.vault, cfg.subsFolder);
-        console.error('DEBUG: subs.length =', subs.length);
         if (subs.length === 0) {
             return [[{ alias: '-', status: 'no subscriptions', new_articles: 0, files: '-' }]];
         }
@@ -354,7 +416,7 @@ cli({
             try {
                 articles = await getArticlesFromServer(cfg.baseUrl, cfg.apiBase, cfg.akSk, cfg.username, cfg.password, sub.mp_id, kwargs.limit || 50);
             }
-            catch {
+            catch (e) {
                 results.push({ alias: sub.alias, status: 'fetch error', new_articles: 0, files: '-' });
                 continue;
             }
@@ -374,7 +436,21 @@ cli({
             let writtenCount = 0;
             const writtenFiles = [];
             for (const article of newArticles) {
-                const filePath = writeArticleToVault(cfg.vault, cfg.articlesFolder, sub, article);
+                console.error('DEBUG loop: article.title =', article.title, 'content len =', (article.content || '').length, 'url =', !!article.url);
+                // If content is empty but URL exists, try to fetch content from URL
+                let articleWithContent = article;
+                if ((!article.content || article.content.length < 100) && article.url) {
+                    console.error('DEBUG: Need to fetch content, URL:', article.url);
+                    const fetchedContent = await fetchArticleContentFromUrl(article.url, cfg.vault);
+                    console.error('DEBUG: Fetched content length:', fetchedContent.length);
+                    if (fetchedContent && fetchedContent.length > 100) {
+                        articleWithContent = { ...article, content: fetchedContent };
+                    }
+                }
+                else {
+                    console.error('DEBUG: Skipping fetch, content len =', (article.content || '').length, 'has url =', !!article.url);
+                }
+                const filePath = writeArticleToVault(cfg.vault, cfg.articlesFolder, sub, articleWithContent);
                 if (filePath) {
                     writtenCount++;
                     writtenFiles.push(path.basename(filePath));
@@ -396,8 +472,7 @@ cli({
         }
         // Save updated sync state
         writeSyncState(cfg.vault, cfg.stateFile, syncState);
-        console.error('DEBUG: results =', JSON.stringify(results));
-        return [results];
+        return results;
     },
 });
 /**

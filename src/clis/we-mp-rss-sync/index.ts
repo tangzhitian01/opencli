@@ -17,6 +17,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { spawn } from 'node:child_process';
 import { cli, Strategy } from '../../registry.js';
 
 // ============================================================
@@ -159,6 +160,65 @@ function writeSyncState(vault: string, stateFile: string, state: SyncState): voi
 
 function sanitizeFilename(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, '-').substring(0, 100);
+}
+
+// Fetch article content from URL using weixin download
+async function fetchArticleContentFromUrl(url: string, vault: string): Promise<string> {
+  return new Promise((resolve) => {
+    const tmpDir = path.join(vault, '.smart-env', 'multi', 'tmp_fetch');
+    ensureDir(tmpDir);
+
+    // Call weixin download with output to tmp dir
+    const proc = spawn('opencli', ['weixin', 'download', '--url', url, '--output', tmpDir], {
+      cwd: vault,
+      shell: true,
+      env: { ...process.env },
+    });
+
+    proc.on('close', () => {
+      // Find the created markdown file (may be in subdirectory)
+      try {
+        if (fs.existsSync(tmpDir)) {
+          // Recursively find all .md files
+          const findMdFiles = (dir: string): string[] => {
+            let results: string[] = [];
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+              const fullPath = path.join(dir, entry.name);
+              if (entry.isDirectory()) {
+                results = results.concat(findMdFiles(fullPath));
+              } else if (entry.name.endsWith('.md')) {
+                results.push(fullPath);
+              }
+            }
+            return results;
+          };
+          const files = findMdFiles(tmpDir);
+          if (files.length > 0) {
+            const mdPath = files[0];
+            const fullContent = fs.readFileSync(mdPath, 'utf-8');
+            // Clean up entire tmpDir
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+
+            // Extract just the body content (after the last --- separator)
+            // The format is: # Title\n\n> metadata...\n---\n# Title\n\nbody
+            // Find the last --- separator and get everything after it
+            const lastSepIdx = fullContent.lastIndexOf('\n---\n');
+            if (lastSepIdx !== -1) {
+              const body = fullContent.slice(lastSepIdx + 5).trim();
+              resolve(body);
+            } else {
+              resolve(fullContent);
+            }
+            return;
+          }
+        }
+      } catch (e) {
+        // Fall through
+      }
+      resolve('');
+    });
+  });
 }
 
 function writeArticleToVault(
@@ -464,7 +524,21 @@ cli({
       let writtenCount = 0;
       const writtenFiles: string[] = [];
       for (const article of newArticles) {
-        const filePath = writeArticleToVault(cfg.vault, cfg.articlesFolder, sub, article);
+        console.error('DEBUG loop: article.title =', article.title, 'content len =', (article.content || '').length, 'url =', !!article.url);
+        // If content is empty but URL exists, try to fetch content from URL
+        let articleWithContent = article;
+        if ((!article.content || article.content.length < 100) && article.url) {
+          console.error('DEBUG: Need to fetch content, URL:', article.url);
+          const fetchedContent = await fetchArticleContentFromUrl(article.url, cfg.vault);
+          console.error('DEBUG: Fetched content length:', fetchedContent.length);
+          if (fetchedContent && fetchedContent.length > 100) {
+            articleWithContent = { ...article, content: fetchedContent };
+          }
+        } else {
+          console.error('DEBUG: Skipping fetch, content len =', (article.content || '').length, 'has url =', !!article.url);
+        }
+
+        const filePath = writeArticleToVault(cfg.vault, cfg.articlesFolder, sub, articleWithContent);
         if (filePath) {
           writtenCount++;
           writtenFiles.push(path.basename(filePath));
