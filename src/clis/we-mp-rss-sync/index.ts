@@ -209,32 +209,63 @@ function writeArticleToVault(
 }
 
 function htmlToMarkdown(html: string): string {
-  // Simple HTML to basic markdown conversion
+  // Clean HTML and convert to markdown
   return html
+    // Remove script and style tags with contents first
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    // Remove HTML comments
+    .replace(/<!--[\s\S]*?-->/g, '')
+    // Remove WeChat JavaScript variables and code patterns
+    .replace(/var\s+\w+\s*=\s*("[^"]*"|'[^']*'|\[\]|\{\}|[^;]+);?/gi, '')
+    .replace(/window\.__\w+\s*=\s*[^;]+;/gi, '')
+    .replace(/\(\(\)\s*=>\s*\{[\s\S]*?\}\)\(\);?/gi, '')
+    .replace(/try\s*\{[\s\S]*?catch\([^)]*\)\s*\{[\s\S]*?\}/gi, '')
+    .replace(/function\s+\w+\([^)]*\)\s*\{[\s\S]*?\}/gi, '')
+    // Convert headings
     .replace(/<h1[^>]*>(.*?)<\/h1>/gi, '# $1\n')
     .replace(/<h2[^>]*>(.*?)<\/h2>/gi, '## $1\n')
     .replace(/<h3[^>]*>(.*?)<\/h3>/gi, '### $1\n')
     .replace(/<h4[^>]*>(.*?)<\/h4>/gi, '#### $1\n')
+    // Convert paragraphs and line breaks
     .replace(/<p[^>]*>(.*?)<\/p>/gi, '$1\n\n')
     .replace(/<br\s*\/?>/gi, '\n')
+    // Convert formatting
     .replace(/<strong[^>]*>(.*?)<\/strong>/gi, '**$1**')
     .replace(/<b[^>]*>(.*?)<\/b>/gi, '**$1**')
     .replace(/<em[^>]*>(.*?)<\/em>/gi, '*$1*')
     .replace(/<i[^>]*>(.*?)<\/i>/gi, '*$1*')
+    // Convert links
     .replace(/<a[^>]*href=["'](.*?)["'][^>]*>(.*?)<\/a>/gi, '[$2]($1)')
+    // Convert lists
     .replace(/<li[^>]*>(.*?)<\/li>/gi, '- $1\n')
+    // Convert code blocks
     .replace(/<code[^>]*>(.*?)<\/code>/gi, '`$1`')
     .replace(/<pre[^>]*>(.*?)<\/pre>/gi, '```\n$1\n```\n')
+    // Convert images
     .replace(/<img[^>]*src=["'](.*?)["'][^>]*alt=["'](.*?)["'][^>]*>/gi, '![$2]($1)')
     .replace(/<img[^>]*src=["'](.*?)["'][^>]*>/gi, '![]($1)')
-    .replace(/<[^>]+>/g, '')  // Remove remaining tags
+    // Remove remaining tags
+    .replace(/<[^>]+>/g, '')
+    // Decode HTML entities
     .replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
+    // Clean up JavaScript residue patterns
+    .replace(/if\s*\(!!\s*\([^)]+\)\s*&&\s*!\([^)]+\)\)/gi, '')
+    .replace(/location\.href\s*=\s*[^;]+;/gi, '')
+    .replace(/\s+\|\|\s*""/g, '')
+    .replace(/true;?\s*/g, '')
+    .replace(/false;?\s*/g, '')
+    // Remove empty brackets and braces
+    .replace(/\(\s*\)/g, '')
+    .replace(/\{\s*\}/g, '')
+    // Clean multiple newlines
     .replace(/\n{3,}/g, '\n\n')
+    // Split, trim lines, filter empty, join
     .split('\n')
     .map(line => line.trim())
     .filter(line => line.length > 0)
